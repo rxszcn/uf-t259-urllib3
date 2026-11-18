@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import io
 import socket
 import typing
 from http.client import HTTPMessage, ResponseNotReady
@@ -8,6 +9,7 @@ from unittest import mock
 
 import pytest
 
+from urllib3._base_connection import ProxyConfig
 from urllib3.connection import (  # type: ignore[attr-defined]
     RECENT_DATE,
     CertificateError,
@@ -21,14 +23,92 @@ from urllib3.connection import (  # type: ignore[attr-defined]
 )
 from urllib3.exceptions import HTTPError, ProxyError, SSLError
 from urllib3.util import ssl_
+from urllib3.util.proxy_digest import (
+    ProxyDigestCredentials,
+    _parse_directives,
+)
 from urllib3.util.request import SKIP_HEADER
 from urllib3.util.ssl_match_hostname import (
     CertificateError as ImplementationCertificateError,
 )
 from urllib3.util.ssl_match_hostname import _dnsname_match, match_hostname
+from urllib3.util.url import parse_url
 
 if typing.TYPE_CHECKING:
     from urllib3.util.ssl_ import _TYPE_PEER_CERT_RET_DICT
+
+
+class _SequentialProxySocket:
+    """Fake socket replaying scripted proxy CONNECT responses.
+
+    Every new connection (``_new_conn`` call) pops the next raw HTTP response
+    from ``responses`` and exposes a fresh ``makefile()`` stream over it,
+    while recording every CONNECT request sent on the wire.
+    """
+
+    def __init__(self, responses: list[bytes]) -> None:
+        self._responses = list(responses)
+        self.sent_requests: list[bytes] = []
+        self.closed = False
+        self.timeout: float | None = None
+        self._current = b""
+
+    def settimeout(self, timeout: float | None) -> None:
+        self.timeout = timeout
+
+    def connect(self) -> None:
+        pass
+
+    def sendall(self, data: bytes) -> None:
+        self.send(data)
+
+    def send(self, data: bytes) -> int:
+        self.sent_requests.append(data)
+        return len(data)
+
+    def makefile(self, *args: typing.Any, **kwargs: typing.Any) -> io.BytesIO:
+        return io.BytesIO(self._current)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def shutdown(self, flag: int) -> None:
+        pass
+
+    def pop_next(self) -> "_SequentialProxySocket":
+        # Each _new_conn call returns the same object, armed with the next
+        # scripted response.
+        self._current = self._responses.pop(0)
+        self.closed = False
+        return self
+
+
+_PROXY_DIGEST_CHALLENGE = (
+    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+    b'Proxy-Authenticate: Digest realm="proxy-realm", '
+    b'qop="auth", nonce="deadbeefnonce", '
+    b'opaque="opaque-value"\r\n'
+    b"Content-Length: 0\r\n\r\n"
+)
+_PROXY_TUNNEL_OK = b"HTTP/1.1 200 Connection Established\r\nContent-Length: 0\r\n\r\n"
+
+
+def _tunnel_connection(
+    credentials: ProxyDigestCredentials | None,
+) -> tuple[HTTPConnection, _SequentialProxySocket]:
+    proxy = parse_url("http://proxy.example:3128")
+    # The connection's host is the proxy itself; the target is declared
+    # solely via set_tunnel(), matching HTTPSConnectionPool wiring.
+    conn = HTTPConnection(
+        "proxy.example",
+        port=3128,
+        proxy=proxy,
+        proxy_config=ProxyConfig(None, False, None, None, credentials),
+    )
+    conn.set_tunnel("target.example", 443, scheme="http")
+    fake_sock = _SequentialProxySocket([_PROXY_DIGEST_CHALLENGE, _PROXY_TUNNEL_OK])
+    conn._new_conn = lambda: fake_sock.pop_next()  # type: ignore[method-assign]
+    return conn, fake_sock
 
 
 class TestConnection:
@@ -384,3 +464,88 @@ class TestConnection:
             conn.putheader("X-Test", "a", "b")
 
         http_client_putheader.assert_called_once_with("X-Test", "a", "b")
+
+    def test_tunnel_proxy_digest_407_rebuilds_tunnel(self) -> None:
+        """A 407 Digest challenge during CONNECT is answered and the tunnel
+        is rebuilt on a fresh socket with Proxy-Authorization on the wire."""
+        credentials = ProxyDigestCredentials("proxy-user", "proxy-pass")
+        conn, fake_sock = _tunnel_connection(credentials)
+
+        conn.connect()
+
+        assert conn.is_closed is False
+        assert conn.has_connected_to_proxy is True
+        # Two CONNECT exchanges: the bare one, then the authenticated retry.
+        assert len(fake_sock.sent_requests) == 2
+        first_request, second_request = fake_sock.sent_requests
+        assert b"CONNECT target.example:443" in first_request
+        assert b"Proxy-Authorization" not in first_request
+        assert b"CONNECT target.example:443" in second_request
+        assert b"Proxy-Authorization: Digest " in second_request
+
+        digest_header = next(
+            line
+            for line in second_request.split(b"\r\n")
+            if line.startswith(b"Proxy-Authorization: Digest ")
+        ).decode("latin-1")
+        directives = _parse_directives(
+            digest_header.removeprefix("Proxy-Authorization: Digest ")
+        )
+        assert directives["username"] == "proxy-user"
+        assert directives["realm"] == "proxy-realm"
+        assert directives["nonce"] == "deadbeefnonce"
+        assert directives["opaque"] == "opaque-value"
+        assert directives["qop"] == "auth"
+        assert directives["nc"] == "00000001"
+        assert directives["algorithm"] == "MD5"
+        assert directives["uri"] == "target.example:443"
+
+        import hashlib
+
+        ha1 = hashlib.md5(b"proxy-user:proxy-realm:proxy-pass").hexdigest()
+        ha2 = hashlib.md5(b"CONNECT:target.example:443").hexdigest()
+        expected_response = hashlib.md5(
+            f"{ha1}:deadbeefnonce:00000001:{directives['cnonce']}:auth:{ha2}".encode()
+        ).hexdigest()
+        assert directives["response"] == expected_response
+        conn.close()
+
+    def test_tunnel_without_proxy_digest_credentials_keeps_failure(self) -> None:
+        """Without configured credentials a 407 on CONNECT fails with the
+        historical tunnel error and no Proxy-Authorization header is sent."""
+        conn, fake_sock = _tunnel_connection(None)
+
+        with pytest.raises(OSError, match="Tunnel connection failed: 407"):
+            conn.connect()
+
+        assert len(fake_sock.sent_requests) == 1
+        assert b"Proxy-Authorization" not in fake_sock.sent_requests[0]
+        assert conn.is_closed is True
+
+    def test_tunnel_unsupported_digest_challenge_keeps_failure(self) -> None:
+        """A challenge outside the MD5/auth subset behaves like no creds."""
+        conn = HTTPConnection(
+            "proxy.example",
+            port=3128,
+            proxy=parse_url("http://proxy.example:3128"),
+            proxy_config=ProxyConfig(
+                None,
+                False,
+                None,
+                None,
+                ProxyDigestCredentials("proxy-user", "proxy-pass"),
+            ),
+        )
+        conn.set_tunnel("target.example", 443, scheme="http")
+        unsupported = (
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+            b'Proxy-Authenticate: Digest realm="r", nonce="n", '
+            b'qop="auth-int"\r\nContent-Length: 0\r\n\r\n'
+        )
+        fake_sock = _SequentialProxySocket([unsupported])
+        conn._new_conn = lambda: fake_sock.pop_next()  # type: ignore[method-assign]
+
+        with pytest.raises(OSError, match="Tunnel connection failed: 407"):
+            conn.connect()
+        assert b"Proxy-Authorization" not in fake_sock.sent_requests[0]
+        conn.close()

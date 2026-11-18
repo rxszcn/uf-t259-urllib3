@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
+from urllib3._collections import HTTPHeaderDict
 from urllib3.connectionpool import HTTPConnectionPool
 from urllib3.exceptions import (
     LocationParseError,
@@ -13,10 +14,16 @@ from urllib3.exceptions import (
 )
 from urllib3.poolmanager import ProxyManager
 from urllib3.response import HTTPResponse
+from urllib3.util.proxy_digest import ProxyDigestCredentials, _parse_directives
 from urllib3.util.retry import Retry
 from urllib3.util.url import parse_url
 
 from .port_helpers import find_unused_port
+
+_PROXY_DIGEST_CHALLENGE_HEADER = (
+    'Digest realm="proxy-realm", qop="auth", '
+    'nonce="deadbeefnonce", opaque="opaque-value"'
+)
 
 
 class TestProxyManager:
@@ -182,3 +189,80 @@ class TestProxyManager:
             assert ei1.value.reason is not None
             assert isinstance(ei1.value.reason, ProxyError)
             assert isinstance(ei1.value.reason.original_error, NewConnectionError)
+
+    def test_forwarding_proxy_digest_407_answers_and_resends(self) -> None:
+        """A 407 on a forwarded request is answered with Digest credentials
+        and the request is re-sent carrying Proxy-Authorization."""
+        challenge_response = HTTPResponse(
+            status=407,
+            headers=HTTPHeaderDict(
+                {"Proxy-Authenticate": _PROXY_DIGEST_CHALLENGE_HEADER}
+            ),
+        )
+        success_response = HTTPResponse(status=200)
+
+        credentials = ProxyDigestCredentials("proxy-user", "proxy-pass")
+        with ProxyManager(
+            "http://proxy:8080", proxy_digest_credentials=credentials
+        ) as manager:
+            assert manager.proxy_config.proxy_digest_credentials is credentials
+            with patch.object(
+                HTTPConnectionPool,
+                "_make_request",
+                side_effect=[challenge_response, success_response],
+            ) as request:
+                response = manager.urlopen(
+                    "GET", "http://example.com/path?x=1", retries=0
+                )
+
+        assert response.status == 200
+        assert request.call_count == 2
+        # The first request carries no Proxy-Authorization header.
+        first_headers = request.call_args_list[0].kwargs["headers"]
+        assert "Proxy-Authorization" not in first_headers
+
+        second_headers = request.call_args_list[1].kwargs["headers"]
+        digest_header = second_headers["Proxy-Authorization"]
+        assert digest_header.startswith("Digest ")
+        directives = _parse_directives(digest_header.removeprefix("Digest "))
+        assert directives["username"] == "proxy-user"
+        assert directives["realm"] == "proxy-realm"
+        assert directives["nonce"] == "deadbeefnonce"
+        assert directives["opaque"] == "opaque-value"
+        assert directives["qop"] == "auth"
+        assert directives["nc"] == "00000001"
+        assert directives["algorithm"] == "MD5"
+        # In forwarding mode the digest URI is the absolute-form request target.
+        assert directives["uri"] == "http://example.com/path?x=1"
+
+        import hashlib
+
+        ha1 = hashlib.md5(b"proxy-user:proxy-realm:proxy-pass").hexdigest()
+        ha2 = hashlib.md5(b"GET:http://example.com/path?x=1").hexdigest()
+        expected = hashlib.md5(
+            f"{ha1}:deadbeefnonce:00000001:{directives['cnonce']}:auth:{ha2}".encode()
+        ).hexdigest()
+        assert directives["response"] == expected
+
+    def test_forwarding_proxy_407_without_credentials_passes_through(self) -> None:
+        """Without Digest credentials the proxy's 407 is returned to the
+        caller exactly as before, with no authentication retry."""
+        challenge_response = HTTPResponse(
+            status=407,
+            headers=HTTPHeaderDict(
+                {"Proxy-Authenticate": _PROXY_DIGEST_CHALLENGE_HEADER}
+            ),
+        )
+        with ProxyManager("http://proxy:8080") as manager:
+            assert manager.proxy_config.proxy_digest_credentials is None
+            with patch.object(
+                HTTPConnectionPool,
+                "_make_request",
+                return_value=challenge_response,
+            ) as request:
+                response = manager.urlopen("GET", "http://example.com/", retries=0)
+
+        assert response.status == 407
+        assert response.headers["Proxy-Authenticate"] == _PROXY_DIGEST_CHALLENGE_HEADER
+        assert request.call_count == 1
+        assert "Proxy-Authorization" not in request.call_args.kwargs["headers"]

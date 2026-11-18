@@ -3,6 +3,7 @@ from __future__ import annotations
 import typing
 
 from .util.connection import _TYPE_SOCKET_OPTIONS
+from .util.proxy_digest import ProxyDigestCredentials
 from .util.timeout import _DEFAULT_TIMEOUT, _TYPE_TIMEOUT
 from .util.url import Url
 
@@ -16,6 +17,10 @@ class ProxyConfig(typing.NamedTuple):
     use_forwarding_for_https: bool
     assert_hostname: None | str | typing.Literal[False]
     assert_fingerprint: str | None
+    # Credentials used to answer a proxy Digest (RFC 7616) 407 challenge.
+    # ``None`` preserves the historical behavior of surfacing the 407 /
+    # tunnel failure to the caller without attempting authentication.
+    proxy_digest_credentials: ProxyDigestCredentials | None = None
 
 
 class _ResponseOptions(typing.NamedTuple):

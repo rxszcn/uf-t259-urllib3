@@ -42,7 +42,11 @@ from .exceptions import (
 from .response import BaseHTTPResponse
 from .util.connection import is_connection_dropped
 from .util.proxy import connection_requires_http_tunnel
-from .util.request import _TYPE_BODY_POSITION, set_file_position
+from .util.proxy_digest import (
+    build_proxy_digest_authorization,
+    extract_digest_challenge,
+)
+from .util.request import _TYPE_BODY_POSITION, rewind_body, set_file_position
 from .util.retry import Retry
 from .util.ssl_match_hostname import CertificateError
 from .util.timeout import _DEFAULT_TIMEOUT, _TYPE_DEFAULT, Timeout
@@ -596,6 +600,7 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         body_pos: _TYPE_BODY_POSITION | None = None,
         preload_content: bool = True,
         decode_content: bool = True,
+        _proxy_digest_forwarded: bool = False,
         **response_kw: typing.Any,
     ) -> BaseHTTPResponse:
         """
@@ -889,6 +894,59 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 decode_content=decode_content,
                 **response_kw,
             )
+
+        # Handle a proxy Digest (RFC 7616) challenge in forwarding mode.
+        # CONNECT tunnels are handled in the connection layer instead; here
+        # the proxy's 407 reaches us as an ordinary response. Only one
+        # authenticated re-request is attempted, and without configured
+        # credentials (or for an unsupported challenge) the 407 is returned
+        # to the caller unchanged, preserving the historical behavior.
+        if (
+            response.status == 407
+            and not _proxy_digest_forwarded
+            and not http_tunnel_required
+            and self.proxy_config is not None
+            and self.proxy_config.proxy_digest_credentials is not None
+        ):
+            challenge = extract_digest_challenge(response.headers)
+            authorization = (
+                build_proxy_digest_authorization(
+                    challenge,
+                    self.proxy_config.proxy_digest_credentials,
+                    method=method,
+                    uri=url,
+                )
+                if challenge is not None
+                else None
+            )
+            if authorization is not None:
+                response.drain_conn()
+                # Rewind an upload so the authenticated re-request carries
+                # the same body; unrewindable bodies raise the same error as
+                # a regular status retry.
+                if body_pos is not None:
+                    rewind_body(typing.cast(typing.IO[typing.Any], body), body_pos)
+                digest_headers = headers.copy()  # type: ignore[union-attr]
+                digest_headers["Proxy-Authorization"] = authorization
+                log.debug("Retrying request with proxy Digest authentication.")
+                return self.urlopen(
+                    method,
+                    original_url,
+                    body,
+                    digest_headers,
+                    retries,
+                    redirect,
+                    assert_same_host,
+                    timeout=timeout,
+                    pool_timeout=pool_timeout,
+                    release_conn=release_conn,
+                    chunked=chunked,
+                    body_pos=body_pos,
+                    preload_content=preload_content,
+                    decode_content=decode_content,
+                    _proxy_digest_forwarded=True,
+                    **response_kw,
+                )
 
         # Handle redirect?
         redirect_location = redirect and response.get_redirect_location()

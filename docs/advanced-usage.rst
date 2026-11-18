@@ -278,6 +278,32 @@ an `absolute URI <https://datatracker.ietf.org/doc/html/rfc9112#name-absolute-fo
 **only use this option with trusted or corporate proxies** as the proxy will have
 full visibility of your requests.
 
+Proxy authentication
+~~~~~~~~~~~~~~~~~~~~
+
+If your proxy requires authentication you can pass credentials to
+:class:`~urllib3.ProxyManager`. For ``Digest`` authentication (RFC 7616),
+provide a :class:`~urllib3.util.proxy_digest.ProxyDigestCredentials` through the
+``proxy_digest_credentials`` argument. When the proxy answers with a
+``407 Proxy Authentication Required`` challenge, urllib3 computes the MD5/``auth``
+response and retries the request (or the HTTPS ``CONNECT`` tunnel) automatically:
+
+.. code-block:: python
+
+    from urllib3.util.proxy_digest import ProxyDigestCredentials
+
+    proxy = urllib3.ProxyManager(
+        "https://localhost:3128/",
+        proxy_digest_credentials=ProxyDigestCredentials("user", "password"),
+    )
+    proxy.request("GET", "https://google.com/")
+
+Without ``proxy_digest_credentials`` a ``407`` is returned (forwarding mode) or
+surfaced as a tunnel error (CONNECT mode), exactly as before. Static
+``Proxy-Authorization`` headers passed through ``proxy_headers`` are unaffected and
+keep working for schemes such as Basic that do not require a challenge/response
+exchange.
+
 .. _https_proxy_error_http_proxy:
 
 Your proxy appears to only use HTTP and not HTTPS

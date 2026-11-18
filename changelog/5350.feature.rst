@@ -1,0 +1,1 @@
+Added support for HTTP proxy ``Digest`` authentication (RFC 7616, MD5 / ``auth`` qop) via the new ``proxy_digest_credentials`` parameter of ``ProxyManager``. A ``407 Proxy Authentication Required`` challenge is now answered and the request or CONNECT tunnel retried automatically, both for HTTPS tunnels and forwarded plain-HTTP requests.

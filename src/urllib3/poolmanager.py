@@ -26,6 +26,7 @@ from .exceptions import (
 from .response import BaseHTTPResponse
 from .util.connection import _TYPE_SOCKET_OPTIONS
 from .util.proxy import connection_requires_http_tunnel
+from .util.proxy_digest import ProxyDigestCredentials
 from .util.retry import Retry
 from .util.timeout import Timeout
 from .util.url import Url, parse_url
@@ -563,6 +564,15 @@ class ProxyManager(PoolManager):
     :param proxy_assert_fingerprint:
         The fingerprint of the certificate to verify against.
 
+    :param proxy_digest_credentials:
+        A :class:`~urllib3.util.proxy_digest.ProxyDigestCredentials` holding
+        the username and password used to answer a proxy ``Digest``
+        authentication challenge (RFC 7616, MD5 / ``auth`` qop subset) when
+        the proxy responds with ``407``. Applies both to HTTPS CONNECT
+        tunnels and to forwarded plain-HTTP requests. When ``None`` (the
+        default), a ``407`` is surfaced to the caller as before instead of
+        attempting authentication.
+
     Example:
 
     .. code-block:: python
@@ -597,6 +607,7 @@ class ProxyManager(PoolManager):
         use_forwarding_for_https: bool = False,
         proxy_assert_hostname: None | str | typing.Literal[False] = None,
         proxy_assert_fingerprint: str | None = None,
+        proxy_digest_credentials: ProxyDigestCredentials | None = None,
         **connection_pool_kw: typing.Any,
     ) -> None:
         if isinstance(proxy_url, HTTPConnectionPool):
@@ -632,11 +643,13 @@ class ProxyManager(PoolManager):
 
         self.proxy = proxy
         self.proxy_headers = proxy_headers or {}
+        self.proxy_digest_credentials = proxy_digest_credentials
         self.proxy_config = ProxyConfig(
             proxy_ssl_context,
             use_forwarding_for_https,
             proxy_assert_hostname,
             proxy_assert_fingerprint,
+            proxy_digest_credentials,
         )
 
         connection_pool_kw["_proxy"] = self.proxy

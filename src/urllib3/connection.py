@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import http.client
+import io
 import logging
 import os
 import re
@@ -51,6 +52,10 @@ from .exceptions import (
     SystemTimeWarning,
 )
 from .util import SKIP_HEADER, SKIPPABLE_HEADERS, connection, ssl_
+from .util.proxy_digest import (
+    ProxyDigestCredentials,
+    build_proxy_digest_authorization,
+)
 from .util.request import body_to_chunks
 from .util.ssl_ import assert_fingerprint as _assert_fingerprint
 from .util.ssl_ import (
@@ -80,6 +85,21 @@ _CONTAINS_CONTROL_CHAR_RE = re.compile(r"[^-!#$%&'*+.^_`|~0-9a-zA-Z]")
 # Starting the optional OWS match at the beginning of a whitespace run avoids
 # quadratic backtracking for long header values.
 _OBSOLETE_FOLD_RE = re.compile(r"(?:(?<![ \t])[ \t]+)?\r\n[ \t]+")
+
+
+class _ProxyDigestChallenge(OSError):
+    """Internal signal: a proxy answered a CONNECT request with ``407``.
+
+    Carries the raw ``Proxy-Authenticate`` header value so ``connect()`` can
+    answer it using the configured :class:`ProxyDigestCredentials` and
+    rebuild the tunnel. It subclasses :class:`OSError` so that, if it ever
+    escapes the digest-retry logic, it keeps matching the exception types
+    callers already handle for tunnel failures.
+    """
+
+    def __init__(self, challenge: str | None) -> None:
+        super().__init__("Tunnel connection failed: 407 Proxy Authentication Required")
+        self.challenge = challenge
 
 
 def _normalize_header_value(value: str) -> str:
@@ -207,6 +227,7 @@ class HTTPConnection(_HTTPConnection):
         self._tunnel_host: str | None = None
         self._tunnel_port: int | None = None
         self._tunnel_scheme: str | None = None
+        self._proxy_digest_attempted = False
 
     def __str__(self) -> str:
         return f"{type(self).__name__}(host={self.host!r}, port={self.port!r})"
@@ -302,110 +323,115 @@ class HTTPConnection(_HTTPConnection):
         )
         _contains_disallowed_url_pchar_re = re.compile("[\x00-\x20\x7f]")
 
-        if sys.version_info < (3, 11, 16):
-            # `_tunnel` copied from 3.11.15 backporting
-            # https://github.com/python/cpython/commit/0d4026432591d43185568dd31cef6a034c4b9261
-            # and https://github.com/python/cpython/commit/6fbc61070fda2ffb8889e77e3b24bca4249ab4d1
-            # plus a fix from https://github.com/python/cpython/commit/56b7100b04e44ea27989242b176beb8f016b2c53
-            def _tunnel(self) -> None:
-                if self._contains_disallowed_url_pchar_re.search(self._tunnel_host):  # type: ignore[arg-type]
-                    raise ValueError(
-                        "Tunnel host can't contain control characters %r"
-                        % (self._tunnel_host,)
-                    )
-                _MAXLINE = http.client._MAXLINE  # type: ignore[attr-defined]
-                connect = b"CONNECT %s:%d HTTP/1.0\r\n" % (  # type: ignore[str-format]
-                    self._wrap_ipv6(self._tunnel_host.encode("ascii")),  # type: ignore[union-attr]
-                    self._tunnel_port,
+    # A single urllib3-owned CONNECT implementation is used on every
+    # supported interpreter so that the security backports above (invalid
+    # header/host rejection) and proxy Digest authentication are available
+    # uniformly, including on versions whose stdlib ``_tunnel`` hides the
+    # ``407`` challenge behind a generic OSError.
+    def _tunnel(self) -> None:
+        tunnel_host = self._tunnel_host
+        tunnel_port = self._tunnel_port
+        assert tunnel_host is not None and tunnel_port is not None
+        if self._contains_disallowed_url_pchar_re.search(tunnel_host):
+            raise ValueError(
+                "Tunnel host can't contain control characters %r" % (tunnel_host,)
+            )
+        connect = b"CONNECT %s:%d HTTP/1.1\r\n" % (
+            self._wrap_ipv6(tunnel_host.encode("idna")),
+            tunnel_port,
+        )
+        headers = [connect]
+        for header, value in self._tunnel_headers.items():  # type: ignore[attr-defined]
+            header_bytes = header.encode("latin-1")
+            value_bytes = value.encode("latin-1")
+            if not self._is_legal_header_name(header_bytes):
+                raise ValueError(f"Invalid header name {header_bytes!r}")
+            if self._is_illegal_header_value(value_bytes):
+                raise ValueError(f"Invalid header value {value_bytes!r}")
+            headers.append(b"%s: %s\r\n" % (header_bytes, value_bytes))
+        headers.append(b"\r\n")
+        # Making a single send() call instead of one per line encourages
+        # the host OS to use a more optimal packet size instead of
+        # potentially emitting a series of small packets.
+        self.send(b"".join(headers))
+        del headers
+
+        response = self.response_class(self.sock, method=self._method)  # type: ignore[attr-defined]
+        try:
+            version, code, message = response._read_status()  # type: ignore[attr-defined]
+
+            self._raw_proxy_headers = http.client._read_headers(response.fp)  # type: ignore[attr-defined]
+
+            if self.debuglevel > 0:
+                for header in self._raw_proxy_headers:
+                    print("header:", header.decode())
+
+            if code == http.HTTPStatus.PROXY_AUTHENTICATION_REQUIRED:
+                # Drain and surface the challenge without closing the whole
+                # connection state here; ``connect()`` is responsible for
+                # deciding whether credentials are available for a retry.
+                proxy_headers = http.client.parse_headers(
+                    io.BytesIO(b"".join(self._raw_proxy_headers))
                 )
-                headers = [connect]
-                for header, value in self._tunnel_headers.items():  # type: ignore[attr-defined]
-                    header_bytes = header.encode("latin-1")
-                    value_bytes = value.encode("latin-1")
-                    if not self._is_legal_header_name(header_bytes):
-                        raise ValueError(f"Invalid header name {header_bytes!r}")
-                    if self._is_illegal_header_value(value_bytes):
-                        raise ValueError(f"Invalid header value {value_bytes!r}")
-                    headers.append(b"%s: %s\r\n" % (header_bytes, value_bytes))
-                headers.append(b"\r\n")
-                # Making a single send() call instead of one per line encourages
-                # the host OS to use a more optimal packet size instead of
-                # potentially emitting a series of small packets.
-                self.send(b"".join(headers))
-                del headers
+                challenge = proxy_headers.get("Proxy-Authenticate")
+                raise _ProxyDigestChallenge(challenge)
 
-                response = self.response_class(self.sock, method=self._method)  # type: ignore[attr-defined]
-                try:
-                    version, code, message = response._read_status()  # type: ignore[attr-defined]
+            if code != http.HTTPStatus.OK:
+                self.close()
+                raise OSError(f"Tunnel connection failed: {code} {message.strip()}")
 
-                    if code != http.HTTPStatus.OK:
-                        self.close()
-                        raise OSError(
-                            f"Tunnel connection failed: {code} {message.strip()}"
-                        )
-                    while True:
-                        line = response.fp.readline(_MAXLINE + 1)
-                        if len(line) > _MAXLINE:
-                            raise http.client.LineTooLong("header line")
-                        if not line:
-                            # for sites which EOF without sending a trailer
-                            break
-                        if line in (b"\r\n", b"\n", b""):
-                            break
+        finally:
+            response.close()
 
-                        if self.debuglevel > 0:
-                            print("header:", line.decode())
-                finally:
-                    response.close()
+    def _proxy_digest_credentials(self) -> ProxyDigestCredentials | None:
+        if self.proxy_config is None:
+            return None
+        return self.proxy_config.proxy_digest_credentials
 
-        elif (3, 12) <= sys.version_info < (3, 12, 14):
-            # `_tunnel` copied from 3.12.13 backporting
-            # https://github.com/python/cpython/commit/23aef575c7629abcd4aaf028ebd226fb41a4b3c8
-            # plus a fix from https://github.com/python/cpython/commit/c00c386faa579ad71196d33408644478488e43ec
-            def _tunnel(self) -> None:  # noqa: F811
-                if self._contains_disallowed_url_pchar_re.search(self._tunnel_host):  # type: ignore[arg-type]
-                    raise ValueError(
-                        "Tunnel host can't contain control characters %r"
-                        % (self._tunnel_host,)
-                    )
-                connect = b"CONNECT %s:%d HTTP/1.1\r\n" % (  # type: ignore[str-format]
-                    self._wrap_ipv6(self._tunnel_host.encode("idna")),  # type: ignore[union-attr]
-                    self._tunnel_port,
-                )
-                headers = [connect]
-                for header, value in self._tunnel_headers.items():  # type: ignore[attr-defined]
-                    header_bytes = header.encode("latin-1")
-                    value_bytes = value.encode("latin-1")
-                    if not self._is_legal_header_name(header_bytes):
-                        raise ValueError(f"Invalid header name {header_bytes!r}")
-                    if self._is_illegal_header_value(value_bytes):
-                        raise ValueError(f"Invalid header value {value_bytes!r}")
-                    headers.append(b"%s: %s\r\n" % (header_bytes, value_bytes))
-                headers.append(b"\r\n")
-                # Making a single send() call instead of one per line encourages
-                # the host OS to use a more optimal packet size instead of
-                # potentially emitting a series of small packets.
-                self.send(b"".join(headers))
-                del headers
+    def _answer_proxy_digest_challenge(
+        self, challenge: _ProxyDigestChallenge
+    ) -> socket.socket:
+        """Answer a proxy ``407`` Digest challenge and rebuild the tunnel.
 
-                response = self.response_class(self.sock, method=self._method)  # type: ignore[attr-defined]
-                try:
-                    version, code, message = response._read_status()  # type: ignore[attr-defined]
+        A fresh socket is opened because the proxy is free to close the
+        connection that returned the challenge. Returns the replacement
+        socket, which for a plaintext proxy is the same kind of socket as
+        the original one. HTTPSConnection overrides this method to also
+        re-establish the TLS layer to an HTTPS proxy.
+        """
+        credentials = self._proxy_digest_credentials()
+        if (
+            credentials is None
+            or self._proxy_digest_attempted
+            or challenge.challenge is None
+        ):
+            # No credentials configured, an unsupported challenge, or a
+            # second 407 after answering: preserve the historical failure.
+            self.close()
+            raise OSError(str(challenge))
 
-                    self._raw_proxy_headers = http.client._read_headers(response.fp)  # type: ignore[attr-defined]
+        authorization = build_proxy_digest_authorization(
+            challenge.challenge,
+            credentials,
+            method="CONNECT",
+            uri=f"{self._tunnel_host}:{self._tunnel_port}",
+        )
+        if authorization is None:
+            self.close()
+            raise OSError(str(challenge))
 
-                    if self.debuglevel > 0:
-                        for header in self._raw_proxy_headers:
-                            print("header:", header.decode())
-
-                    if code != http.HTTPStatus.OK:
-                        self.close()
-                        raise OSError(
-                            f"Tunnel connection failed: {code} {message.strip()}"
-                        )
-
-                finally:
-                    response.close()
+        self._proxy_digest_attempted = True
+        # The challenged socket is unusable; reconnect to the proxy before
+        # reissuing CONNECT with the computed Proxy-Authorization header.
+        self.sock.close()
+        self.sock = self._new_conn()
+        self._tunnel_headers["Proxy-Authorization"] = authorization  # type: ignore[attr-defined]
+        try:
+            self._tunnel()
+        except _ProxyDigestChallenge:
+            self.close()
+            raise OSError("Tunnel connection failed: 407 Proxy Authentication Required")
+        return self.sock
 
     def connect(self) -> None:
         self.sock = self._new_conn()
@@ -414,7 +440,10 @@ class HTTPConnection(_HTTPConnection):
             self._has_connected_to_proxy = True
 
             # TODO: Fix tunnel so it doesn't depend on self.sock state.
-            self._tunnel()
+            try:
+                self._tunnel()
+            except _ProxyDigestChallenge as challenge:
+                self.sock = self._answer_proxy_digest_challenge(challenge)
 
         # If there's a proxy to be connected to we are fully connected.
         # This is set twice (once above and here) due to forwarding proxies
@@ -466,6 +495,7 @@ class HTTPConnection(_HTTPConnection):
             self._tunnel_host = None
             self._tunnel_port = None
             self._tunnel_scheme = None
+            self._proxy_digest_attempted = False
 
     def putrequest(
         self,
@@ -867,7 +897,10 @@ class HTTPSConnection(HTTPConnection):
                 # If we're tunneling it means we're connected to our proxy.
                 self._has_connected_to_proxy = True
 
-                self._tunnel()
+                try:
+                    self._tunnel()
+                except _ProxyDigestChallenge as challenge:
+                    sock = self._answer_proxy_digest_challenge(challenge)
                 # Override the host with the one we're requesting data from.
                 server_hostname = typing.cast(str, self._tunnel_host)
 
@@ -965,6 +998,48 @@ class HTTPSConnection(HTTPConnection):
         # establishing a tunnel.
         if self._has_connected_to_proxy and self.proxy_is_verified is None:
             self.proxy_is_verified = is_verified
+
+    def _answer_proxy_digest_challenge(
+        self, challenge: _ProxyDigestChallenge
+    ) -> socket.socket:
+        """Rebuild an HTTPS tunnel after a proxy ``407`` Digest challenge.
+
+        An HTTPS proxy connection is wrapped with TLS before CONNECT, so the
+        replacement socket from the base implementation has to be re-wrapped
+        (TLS-in-TLS) before issuing the authenticated CONNECT.
+        """
+        credentials = self._proxy_digest_credentials()
+        if (
+            credentials is None
+            or self._proxy_digest_attempted
+            or challenge.challenge is None
+        ):
+            self.close()
+            raise OSError(str(challenge))
+
+        authorization = build_proxy_digest_authorization(
+            challenge.challenge,
+            credentials,
+            method="CONNECT",
+            uri=f"{self._tunnel_host}:{self._tunnel_port}",
+        )
+        if authorization is None:
+            self.close()
+            raise OSError(str(challenge))
+
+        self._proxy_digest_attempted = True
+        self.sock.close()
+        new_sock = self._new_conn()
+        if self._tunnel_scheme == "https":
+            new_sock = self._connect_tls_proxy(self.host, new_sock)
+        self.sock = new_sock
+        self._tunnel_headers["Proxy-Authorization"] = authorization  # type: ignore[attr-defined]
+        try:
+            self._tunnel()
+        except _ProxyDigestChallenge:
+            self.close()
+            raise OSError("Tunnel connection failed: 407 Proxy Authentication Required")
+        return self.sock
 
     def _connect_tls_proxy(self, hostname: str, sock: socket.socket) -> ssl.SSLSocket:
         """
